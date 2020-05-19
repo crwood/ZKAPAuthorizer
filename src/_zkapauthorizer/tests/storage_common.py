@@ -23,6 +23,13 @@ from struct import (
     pack,
 )
 
+from itertools import (
+    count,
+    islice,
+)
+
+import attr
+
 from twisted.python.filepath import (
     FilePath,
 )
@@ -31,6 +38,11 @@ from .strategies import (
     # Not really a strategy...
     bytes_for_share,
 )
+
+from ..spending import (
+    PassGroup,
+)
+
 
 # Hard-coded in Tahoe-LAFS
 LEASE_INTERVAL = 60 * 60 * 24 * 31
@@ -133,3 +145,83 @@ def whitebox_write_sparse_share(sharepath, version, size, leases, now):
                 in leases
             ),
         )
+
+
+def integer_passes():
+    counter = count(0)
+    def get_passes(message, num_passes):
+        return list(islice(counter, num_passes))
+    return get_passes
+
+
+def pass_factory(get_passes=None):
+    if get_passes is None:
+        get_passes = integer_passes()
+    return _PassFactory(get_passes=get_passes)
+
+
+@attr.s
+class _PassFactory(object):
+    """
+    A stateful pass issuer.
+
+    :ivar (unicode -> int -> [bytes]) _get_passes: A function for getting
+        passes.
+
+    :ivar set[int] in_use: All of the passes given out without a confirmed
+        terminal state.
+
+    :ivar set[int] invalid: All of the passes given out and returned using
+        ``IPassGroup.invalid``.
+
+    :ivar set[int] spent: All of the passes given out and returned via
+        ``IPassGroup.mark_spent``.
+
+    :ivar set[int] issued: All of the passes ever given out.
+
+    :ivar set[int] terminal: All of the passes ever given marked in a terminal
+        state (invalid or spent).
+
+    :ivar set[int] returned: A list of passes which were given out but then
+        returned via ``IPassGroup.reset``.
+
+    """
+    _get_passes = attr.ib()
+
+    returned = attr.ib(default=attr.Factory(list), init=False)
+    in_use = attr.ib(default=attr.Factory(set), init=False)
+    invalid = attr.ib(default=attr.Factory(dict), init=False)
+    spent = attr.ib(default=attr.Factory(set), init=False)
+    issued = attr.ib(default=attr.Factory(set), init=False)
+
+    def get(self, num_passes):
+        passes = []
+        if self._returned:
+            passes.extend(self._returned[:num_passes])
+            del self._returned[:num_passes]
+            num_passes -= len(passes)
+        passes.extend(self._get_passes(num_passes))
+        self.issued.update(passes)
+        self.in_use.update(passes)
+        return PassGroup(self, passes)
+
+    def _mark_spent(self, passes):
+        for p in passes:
+            if p not in self.in_use:
+                raise ValueError("Pass {} cannot be spent, it is not in use.".format(p))
+        self.spent.update(passes)
+        self.in_use.difference_update(passes)
+
+    def _mark_invalid(self, reason, passes):
+        for p in passes:
+            if p not in self.in_use:
+                raise ValueError("Pass {} cannot be invalid, it is not in use.".format(p))
+        self.invalid.update(dict.fromkeys(passes, reason))
+        self.in_use.difference_update(passes)
+
+    def _reset(self, passes):
+        for p in passes:
+            if p not in self.in_use:
+                raise ValueError("Pass {} cannot be reset, it is not in use.".format(p))
+        self._returned.extend(passes)
+        self.in_use.difference_update(passes)

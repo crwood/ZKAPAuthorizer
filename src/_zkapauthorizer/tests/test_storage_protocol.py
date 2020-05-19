@@ -107,6 +107,7 @@ from .storage_common import (
     cleanup_storage_server,
     write_toy_shares,
     whitebox_write_sparse_share,
+    pass_factory,
 )
 from .foolscap import (
     LocalRemote,
@@ -192,11 +193,6 @@ def get_passes(message, count, signing_key):
 class ShareTests(TestCase):
     """
     Tests for interaction with shares.
-
-    :ivar int spent_passes: The number of passes which have been spent so far
-        in the course of a single test (in the case of Hypothesis, every
-        iteration of the test so far, probably; so make relative comparisons
-        instead of absolute ones).
     """
     pass_value = 128 * 1024
 
@@ -205,11 +201,8 @@ class ShareTests(TestCase):
         self.canary = LocalReferenceable(None)
         self.anonymous_storage_server = self.useFixture(AnonymousStorageServer()).storage_server
         self.signing_key = random_signing_key()
-        self.spent_passes = 0
 
-        def counting_get_passes(message, count):
-            self.spent_passes += count
-            return get_passes(message, count, self.signing_key)
+        self.pass_factory = pass_factory()
 
         self.server = ZKAPAuthorizerStorageServer(
             self.anonymous_storage_server,
@@ -220,7 +213,7 @@ class ShareTests(TestCase):
         self.client = ZKAPAuthorizerStorageClient(
             self.pass_value,
             get_rref=lambda: self.local_remote_server,
-            get_passes=counting_get_passes,
+            get_passes=self.factory.get_passes,
         )
 
     def test_get_version(self):

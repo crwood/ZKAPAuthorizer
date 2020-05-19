@@ -36,13 +36,12 @@ from zope.interface import (
 )
 
 from eliot.twisted import (
-    DeferredContext,
+    inline_callbacks,
 )
 
 from twisted.internet.defer import (
     inlineCallbacks,
     returnValue,
-    maybeDeferred,
 )
 from allmydata.interfaces import (
     IStorageServer,
@@ -65,6 +64,7 @@ from .storage_common import (
     get_required_new_passes_for_mutable_write,
 )
 
+
 class IncorrectStorageServerReference(Exception):
     """
     A Foolscap remote object which should reference a ZKAPAuthorizer storage
@@ -84,7 +84,42 @@ class IncorrectStorageServerReference(Exception):
         )
 
 
-def call_with_passes(method, num_passes, get_passes):
+def replace_invalid_passes_with_new_passes(passes, more_passes_required):
+    """
+    Replace all rejected passes in the given pass group with new ones.  Mark
+    any rejected passes as rejected.
+
+    :param IPassGroup passes: A group of passes, some of which may have been
+        rejected.
+
+    :param MorePassesRequired more_passes_required: An exception possibly
+        detailing the rejection of some passes from the group.
+
+    :return: ``None`` if no passes in the group were rejected and so there is
+        nothing to replace.  Otherwise, a new ``IPassGroup`` created from
+        ``passes`` but with rejected passes replaced with new ones.
+    """
+    num_failed = len(more_passes_required.signature_check_failed)
+    if num_failed == 0:
+        # If no signature checks failed then the call just didn't supply
+        # enough passes.  The exception tells us how many passes we should
+        # spend so we could try again with that number of passes but for
+        # now we'll just let the exception propagate.  The client should
+        # always figure out the number of passes right on the first try so
+        # this case is somewhat suspicious.  Err on the side of lack of
+        # service instead of burning extra passes.
+        #
+        # We *could* just `raise` here and only be called from an `except`
+        # suite... but let's not be so vulgar.
+        return None
+    SIGNATURE_CHECK_FAILED.log(count=num_failed)
+    rejected_passes, okay_passes = passes.split(more_passes_required.signature_check_failed)
+    rejected_passes.mark_invalid(u"signature check failed")
+    return okay_passes.expand(len(more_passes_required.signature_check_failed))
+
+
+@inline_callbacks
+def call_with_passes(method, num_passes, bind_passes):
     """
     Call a method, passing the requested number of passes as the first
     argument, and try again if the call fails with an error related to some of
@@ -99,40 +134,36 @@ def call_with_passes(method, num_passes, get_passes):
 
     :param int num_passes: The number of passes to pass to the call.
 
-    :param (unicode -> int -> [bytes]) get_passes: A function for getting
+    :param (unicode -> int -> [bytes]) bind_passes: A function for getting
         passes.
 
     :return: Whatever ``method`` returns.
     """
-    def get_more_passes(reason):
-        reason.trap(MorePassesRequired)
-        num_failed = len(reason.value.signature_check_failed)
-        if num_failed == 0:
-            # If no signature checks failed then the call just didn't supply
-            # enough passes.  The exception tells us how many passes we should
-            # spend so we could try again with that number of passes but for
-            # now we'll just let the exception propagate.  The client should
-            # always figure out the number of passes right on the first try so
-            # this case is somewhat suspicious.  Err on the side of lack of
-            # service instead of burning extra passes.
-            return reason
-        SIGNATURE_CHECK_FAILED.log(count=num_failed)
-        new_passes = get_passes(num_failed)
-        for idx, new_pass in zip(reason.value.signature_check_failed, new_passes):
-            passes[idx] = new_pass
-        return go(passes)
+    with CALL_WITH_PASSES(count=num_passes):
+        passes = bind_passes(num_passes)
+        try:
+            # Try and repeat as necessary.
+            while True:
+                try:
+                    result = yield method(passes)
+                except MorePassesRequired as e:
+                    passes = replace_invalid_passes_with_new_passes(
+                        passes,
+                        e,
+                    )
+                    if passes is None:
+                        raise
+                else:
+                    # Commit the spend of the passes when the operation finally succeeds.
+                    passes.mark_spent()
+                    break
+        except Exception as e:
+            # Something went wrong that we can't address with a retry.
+            passes.reset()
+            raise
 
-    def go(passes):
-        # Capture the Eliot context for the errback.
-        d = DeferredContext(maybeDeferred(method, passes))
-        d.addErrback(get_more_passes)
-        # Return the underlying Deferred without finishing the action.
-        return d.result
-
-    with CALL_WITH_PASSES(count=num_passes).context():
-        passes = get_passes(num_passes)
-        # Finish the Eliot action when this is done.
-        return DeferredContext(go(passes)).addActionFinish()
+        # Give the operation's result to the caller.
+        returnValue(result)
 
 
 def with_rref(f):
@@ -168,7 +199,7 @@ class ZKAPAuthorizerStorageClient(object):
         valid ``RemoteReference`` corresponding to the server-side object for
         this scheme.
 
-    :ivar _get_passes: A two-argument callable which retrieves some passes
+    :ivar _bind_passes: A two-argument callable which retrieves some passes
         which can be used to authorize an operation.  The first argument is a
         bytes (valid utf-8) message binding the passes to the request for
         which they will be used.  The second is an integer giving the number
@@ -179,7 +210,7 @@ class ZKAPAuthorizerStorageClient(object):
     )
     _pass_value = pass_value_attribute()
     _get_rref = attr.ib()
-    _get_passes = attr.ib()
+    _bind_passes = attr.ib()
 
     def _rref(self):
         rref = self._get_rref()
@@ -200,18 +231,18 @@ class ZKAPAuthorizerStorageClient(object):
             )
         return rref
 
-    def _get_encoded_passes(self, message, count):
+    def _bind_passes_encoded(self, message, count):
         """
         :param unicode message: The message to which to bind the passes.
 
-        :return: A list of passes from ``_get_passes`` encoded into their
+        :return: A list of passes from ``_bind_passes`` encoded into their
             ``bytes`` representation.
         """
         assert isinstance(message, unicode)
         return list(
             t.pass_text.encode("ascii")
             for t
-            in self._get_passes(message.encode("utf-8"), count)
+            in self._bind_passes(message.encode("utf-8"), count)
         )
 
     @with_rref
@@ -245,7 +276,7 @@ class ZKAPAuthorizerStorageClient(object):
                 canary,
             ),
             num_passes,
-            partial(self._get_encoded_passes, message),
+            partial(self._bind_passes_encoded, message),
         )
 
     @with_rref
@@ -284,7 +315,7 @@ class ZKAPAuthorizerStorageClient(object):
                 cancel_secret,
             ),
             num_passes,
-            partial(self._get_encoded_passes, add_lease_message(storage_index)),
+            partial(self._bind_passes_encoded, add_lease_message(storage_index)),
         )
         returnValue(result)
 
@@ -311,7 +342,7 @@ class ZKAPAuthorizerStorageClient(object):
                 renew_secret,
             ),
             num_passes,
-            partial(self._get_encoded_passes, renew_lease_message(storage_index)),
+            partial(self._bind_passes_encoded, renew_lease_message(storage_index)),
         )
         returnValue(result)
 
@@ -385,7 +416,7 @@ class ZKAPAuthorizerStorageClient(object):
             ),
             num_passes,
             partial(
-                self._get_encoded_passes,
+                self._bind_passes_encoded,
                 slot_testv_and_readv_and_writev_message(storage_index),
             ),
         )

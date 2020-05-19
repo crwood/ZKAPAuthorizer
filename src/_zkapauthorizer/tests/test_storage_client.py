@@ -16,13 +16,6 @@
 Tests for ``_zkapauthorizer._storage_client``.
 """
 
-import attr
-
-from itertools import (
-    count,
-    islice,
-)
-
 from testtools import (
     TestCase,
 )
@@ -60,30 +53,13 @@ from .._storage_server import (
     _ValidationResult,
 )
 
+from .storage_common import (
+    pass_factory,
+)
+
+
 def pass_counts():
     return integers(min_value=1, max_value=2 ** 8)
-
-
-def pass_factory():
-    return _PassFactory()
-
-@attr.s
-class _PassFactory(object):
-    """
-    A stateful pass issuer.
-
-    :ivar list spent: All of the passes ever issued.
-
-    :ivar _fountain: A counter for making each new pass issued unique.
-    """
-    spent = attr.ib(default=attr.Factory(list))
-
-    _fountain = attr.ib(default=attr.Factory(count))
-
-    def get(self, num_passes):
-        passes = list(islice(self._fountain, num_passes))
-        self.spent.extend(passes)
-        return passes
 
 
 class CallWithPassesTests(TestCase):
@@ -100,7 +76,7 @@ class CallWithPassesTests(TestCase):
         result = object()
         self.assertThat(
             call_with_passes(
-                lambda passes: succeed(result),
+                lambda group: succeed(result),
                 num_passes,
                 pass_factory().get,
             ),
@@ -117,7 +93,7 @@ class CallWithPassesTests(TestCase):
         result = Exception()
         self.assertThat(
             call_with_passes(
-                lambda passes: fail(result),
+                lambda group: fail(result),
                 num_passes,
                 pass_factory().get,
             ),
@@ -140,13 +116,13 @@ class CallWithPassesTests(TestCase):
 
         self.assertThat(
             call_with_passes(
-                lambda passes: succeed(passes),
+                lambda group: succeed(group.passes),
                 num_passes,
                 passes.get,
             ),
             succeeded(
                 Equals(
-                    passes.spent,
+                    sorted(passes.spent),
                 ),
             ),
         )
@@ -160,7 +136,8 @@ class CallWithPassesTests(TestCase):
         """
         passes = pass_factory()
 
-        def reject_even_pass_values(passes):
+        def reject_even_pass_values(group):
+            passes = group.passes
             good_passes = list(idx for (idx, p) in enumerate(passes) if p % 2)
             bad_passes = list(idx for (idx, p) in enumerate(passes) if idx not in good_passes)
             if len(good_passes) < num_passes:
@@ -188,7 +165,8 @@ class CallWithPassesTests(TestCase):
         """
         passes = pass_factory()
 
-        def reject_passes(passes):
+        def reject_passes(group):
+            passes = group.passes
             _ValidationResult(
                 valid=range(len(passes)),
                 signature_check_failed=[],

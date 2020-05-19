@@ -446,7 +446,6 @@ class VoucherStore(object):
                     ),
                 )
 
-
     @with_cursor
     def extract_unblinded_tokens(self, cursor, count):
         """
